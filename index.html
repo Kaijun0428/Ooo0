@@ -1,0 +1,686 @@
+import { useState, useRef } from "react";
+
+// ── Utilities ───────────────────────────────────────────────────────────────
+const today = () => new Date().toISOString().split("T")[0];
+
+function calcBMR({ weight, height, age, gender, bodyFat }) {
+  const w = parseFloat(weight), h = parseFloat(height), a = parseFloat(age), bf = parseFloat(bodyFat);
+  if (bf) return Math.round(370 + 21.6 * w * (1 - bf / 100));
+  if (gender === "male") return Math.round(88.362 + 13.397 * w + 4.799 * h - 5.677 * a);
+  return Math.round(447.593 + 9.247 * w + 3.098 * h - 4.33 * a);
+}
+function calcTDEE(bmr, activity) {
+  const m = { sedentary: 1.2, light: 1.375, moderate: 1.55, active: 1.725, veryActive: 1.9 };
+  return Math.round(bmr * (m[activity] || 1.2));
+}
+const ACT_LABELS = { sedentary: "久坐", light: "輕度", moderate: "中度", active: "積極", veryActive: "非常積極" };
+const SCORE_META = {
+  excellent: { label: "優質", color: "#4ade80", bg: "rgba(74,222,128,0.15)" },
+  good:      { label: "良好", color: "#facc15", bg: "rgba(250,204,21,0.15)" },
+  poor:      { label: "少吃", color: "#f87171", bg: "rgba(248,113,113,0.15)" },
+};
+
+// ── Claude API helpers ───────────────────────────────────────────────────────
+async function analyzeFood(base64, mimeType) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mimeType, data: base64 } },
+          { type: "text", text: `你是一位專業營養師。請分析這張餐點照片，辨識所有食物並估算營養成分。
+請只輸出以下 JSON 格式，不要加任何 markdown 或說明文字：
+{
+  "items": [
+    { "name": "食物名稱", "cal": 數字, "p": 蛋白質g數字, "c": 碳水g數字, "f": 脂肪g數字, "score": "excellent|good|poor" }
+  ],
+  "total": { "cal": 總熱量, "p": 總蛋白質, "c": 總碳水, "f": 總脂肪 },
+  "advice": "一句話飲食建議（繁體中文）"
+}
+score 標準：excellent=高蛋白/蔬菜/健康脂肪, good=均衡食物, poor=高糖/高油炸/加工食品` }
+        ]
+      }]
+    })
+  });
+  const data = await res.json();
+  const text = data.content?.map(i => i.text || "").join("") || "";
+  const clean = text.replace(/```json|```/g, "").trim();
+  return JSON.parse(clean);
+}
+
+async function analyzeInBody(base64, mimeType) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mimeType, data: base64 } },
+          { type: "text", text: `你是一位專業體能評估師。請讀取這張 InBody 或體組成報告圖片，提取所有可見的數值。
+請只輸出以下 JSON 格式，找不到的欄位填 null，不要加任何 markdown 或說明文字：
+{
+  "weight": 體重kg數字或null,
+  "bodyFat": 體脂率%數字或null,
+  "muscleMass": 骨骼肌質量kg數字或null,
+  "fatMass": 體脂肪kg數字或null,
+  "bmi": BMI數字或null,
+  "visceralFat": 內臟脂肪等級數字或null,
+  "bmr": 基礎代謝率kcal數字或null,
+  "bodyWater": 體水分kg數字或null,
+  "boneMass": 骨質量kg數字或null,
+  "assessment": "整體評估一句話（繁體中文）",
+  "suggestions": ["建議1", "建議2", "建議3"]
+}` }
+        ]
+      }]
+    })
+  });
+  const data = await res.json();
+  const text = data.content?.map(i => i.text || "").join("") || "";
+  const clean = text.replace(/```json|```/g, "").trim();
+  return JSON.parse(clean);
+}
+
+function toBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(",")[1]);
+    r.onerror = () => rej(new Error("讀取失敗"));
+    r.readAsDataURL(file);
+  });
+}
+
+// ── Sub-components ───────────────────────────────────────────────────────────
+function Ring({ value, max, color, size = 64, stroke = 7, label, sub }) {
+  const r = (size - stroke) / 2;
+  const circ = 2 * Math.PI * r;
+  const pct = Math.min(value / max, 1);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+      <svg width={size} height={size}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="rgba(255,255,255,.08)" strokeWidth={stroke} />
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={stroke}
+          strokeDasharray={circ} strokeDashoffset={circ*(1-pct)} strokeLinecap="round"
+          transform={`rotate(-90 ${size/2} ${size/2})`}
+          style={{ transition: "stroke-dashoffset .6s cubic-bezier(.4,0,.2,1)" }} />
+        <text x={size/2} y={size/2+5} textAnchor="middle" fill="white" fontSize={12}
+          fontFamily="'DM Mono',monospace" fontWeight="700">{Math.round(pct*100)}%</text>
+      </svg>
+      <span style={{ fontSize: 11, color: "rgba(255,255,255,.6)", textAlign: "center" }}>{label}</span>
+      {sub && <span style={{ fontSize: 10, color, fontFamily: "'DM Mono',monospace" }}>{sub}</span>}
+    </div>
+  );
+}
+
+function WeightChart({ data }) {
+  if (!data.length) return <div style={{ color: "rgba(255,255,255,.3)", textAlign:"center", padding:"24px 0", fontSize:13 }}>尚無體重記錄</div>;
+  const vals = data.map(d => d.w);
+  const minV = Math.min(...vals)-1, maxV = Math.max(...vals)+1;
+  const w=280, h=80;
+  const pts = data.slice(-14).map((d,i,arr) => {
+    const x = 10+(i/Math.max(arr.length-1,1))*(w-20);
+    const y = h-10-((d.w-minV)/(maxV-minV))*(h-20);
+    return `${x},${y}`;
+  }).join(" ");
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} style={{ width:"100%", height:80 }}>
+      <polyline fill="none" stroke="#818cf8" strokeWidth={2} points={pts} strokeLinejoin="round"/>
+      {data.slice(-14).map((d,i,arr) => {
+        const x=10+(i/Math.max(arr.length-1,1))*(w-20);
+        const y=h-10-((d.w-minV)/(maxV-minV))*(h-20);
+        return <circle key={i} cx={x} cy={y} r={3} fill="#818cf8"/>;
+      })}
+    </svg>
+  );
+}
+
+// ── Image Upload Zone ─────────────────────────────────────────────────────────
+function UploadZone({ onFile, accept, label, icon, color }) {
+  const ref = useRef();
+  const [drag, setDrag] = useState(false);
+  return (
+    <div
+      onClick={() => ref.current.click()}
+      onDragOver={e => { e.preventDefault(); setDrag(true); }}
+      onDragLeave={() => setDrag(false)}
+      onDrop={e => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files[0]; if(f) onFile(f); }}
+      style={{
+        border: `2px dashed ${drag ? color : "rgba(255,255,255,.12)"}`,
+        borderRadius: 16, padding: "28px 20px", textAlign: "center", cursor: "pointer",
+        background: drag ? `${color}10` : "rgba(255,255,255,.02)",
+        transition: "all .2s"
+      }}>
+      <input ref={ref} type="file" accept={accept} style={{ display:"none" }}
+        onChange={e => { const f=e.target.files[0]; if(f) onFile(f); e.target.value=""; }}/>
+      <div style={{ fontSize: 32, marginBottom: 8 }}>{icon}</div>
+      <div style={{ fontSize: 13, color: "rgba(255,255,255,.6)" }}>{label}</div>
+      <div style={{ fontSize: 11, color: "rgba(255,255,255,.3)", marginTop: 4 }}>點擊上傳或拖曳圖片</div>
+    </div>
+  );
+}
+
+// ── Spinner ───────────────────────────────────────────────────────────────────
+function Spinner({ color }) {
+  return (
+    <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:12, padding:"24px 0" }}>
+      <div style={{
+        width:36, height:36, borderRadius:"50%",
+        border:`3px solid rgba(255,255,255,.1)`,
+        borderTopColor: color,
+        animation: "spin 0.8s linear infinite"
+      }}/>
+      <div style={{ fontSize:13, color:"rgba(255,255,255,.4)" }}>AI 分析中...</div>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+}
+
+// ── Main App ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const [tab, setTab] = useState("dashboard");
+
+  const [profile, setProfile] = useState({
+    name:"", weight:70, height:170, age:25, gender:"male",
+    bodyFat:"", activity:"moderate", goal:"maintain", waterGoal:2000,
+  });
+  const [profileSaved, setProfileSaved] = useState(false);
+  const [inbodyResult, setInbodyResult] = useState(null);
+  const [inbodyImg, setInbodyImg] = useState(null);
+  const [inbodyLoading, setInbodyLoading] = useState(false);
+  const [inbodyError, setInbodyError] = useState("");
+
+  const [weightLog, setWeightLog] = useState([]);
+  const [todayWeight, setTodayWeight] = useState("");
+  const [waterIntake, setWaterIntake] = useState(0);
+  const [foodLog, setFoodLog] = useState([]);
+
+  // Food photo AI
+  const [foodImg, setFoodImg] = useState(null);
+  const [foodLoading, setFoodLoading] = useState(false);
+  const [foodResult, setFoodResult] = useState(null);
+  const [foodError, setFoodError] = useState("");
+
+  const bmr = calcBMR(profile);
+  const tdee = calcTDEE(bmr, profile.activity);
+  const targetCal = profile.goal==="lose" ? tdee-500 : profile.goal==="gain" ? tdee+300 : tdee;
+  const todayCal = foodLog.reduce((s,f)=>s+f.cal,0);
+  const todayProt = foodLog.reduce((s,f)=>s+f.p,0);
+  const todayCarb = foodLog.reduce((s,f)=>s+f.c,0);
+  const todayFat = foodLog.reduce((s,f)=>s+f.f,0);
+
+  const addWater = ml => setWaterIntake(w=>Math.min(w+ml,profile.waterGoal*1.5));
+  const logWeight = () => {
+    const w=parseFloat(todayWeight); if(!w) return;
+    setWeightLog(l=>[...l.filter(x=>x.d!==today()),{d:today(),w}]);
+    setTodayWeight("");
+  };
+  const addFood = food => setFoodLog(l=>[...l,{...food,id:Date.now()}]);
+
+  // Handle food photo
+  const handleFoodFile = async (file) => {
+    const url = URL.createObjectURL(file);
+    setFoodImg(url);
+    setFoodResult(null);
+    setFoodError("");
+    setFoodLoading(true);
+    try {
+      const b64 = await toBase64(file);
+      const result = await analyzeFood(b64, file.type);
+      setFoodResult(result);
+    } catch(e) {
+      setFoodError("分析失敗，請再試一次");
+    }
+    setFoodLoading(false);
+  };
+
+  const handleAddAllItems = () => {
+    if (!foodResult) return;
+    foodResult.items.forEach(item => addFood(item));
+    setFoodResult(null);
+    setFoodImg(null);
+    setTab("dashboard");
+  };
+
+  // Handle InBody photo
+  const handleInBodyFile = async (file) => {
+    const url = URL.createObjectURL(file);
+    setInbodyImg(url);
+    setInbodyResult(null);
+    setInbodyError("");
+    setInbodyLoading(true);
+    try {
+      const b64 = await toBase64(file);
+      const result = await analyzeInBody(b64, file.type);
+      setInbodyResult(result);
+      // Auto-fill profile if data found
+      if (result.weight) setProfile(p=>({...p, weight: result.weight}));
+      if (result.bodyFat) setProfile(p=>({...p, bodyFat: result.bodyFat}));
+    } catch(e) {
+      setInbodyError("無法讀取報告，請確認圖片清晰度");
+    }
+    setInbodyLoading(false);
+  };
+
+  const css = `
+    @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500;700&family=DM+Sans:wght@300;400;500;600&display=swap');
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { background:#0b0f1a; }
+    input, select { outline:none; border:none; background:rgba(255,255,255,.06); color:white;
+      font-family:'DM Sans',sans-serif; border-radius:10px; padding:10px 14px; font-size:14px; width:100%; }
+    input::placeholder { color:rgba(255,255,255,.3); }
+    select option { background:#1e2536; }
+    ::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:transparent}
+    ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:4px}
+  `;
+
+  const TABS = [
+    {id:"dashboard",icon:"◉",label:"總覽"},
+    {id:"diet",icon:"⊕",label:"飲食"},
+    {id:"weight",icon:"↕",label:"體重"},
+    {id:"water",icon:"◌",label:"水分"},
+    {id:"profile",icon:"◈",label:"資料"},
+  ];
+
+  return (
+    <div style={{ fontFamily:"'DM Sans',sans-serif", background:"linear-gradient(160deg,#0b0f1a 0%,#111827 100%)", minHeight:"100vh", color:"white", maxWidth:420, margin:"0 auto", position:"relative" }}>
+      <style>{css}</style>
+
+      {/* Header */}
+      <div style={{ padding:"28px 24px 0", display:"flex", justifyContent:"space-between", alignItems:"flex-end" }}>
+        <div>
+          <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:28, letterSpacing:"-0.5px" }}>
+            {profile.name ? `Hi, ${profile.name}` : "BodyLog"}
+          </div>
+          <div style={{ fontSize:12, color:"rgba(255,255,255,.4)", marginTop:2 }}>
+            {new Date().toLocaleDateString("zh-TW",{month:"long",day:"numeric",weekday:"short"})}
+          </div>
+        </div>
+        <div style={{ background:"rgba(129,140,248,.2)", border:"1px solid rgba(129,140,248,.3)", borderRadius:12, padding:"6px 14px", fontSize:12, color:"#818cf8", fontFamily:"'DM Mono',monospace" }}>
+          BMR {bmr} kcal
+        </div>
+      </div>
+
+      <div style={{ padding:"20px 24px 100px" }}>
+
+        {/* ── DASHBOARD ── */}
+        {tab==="dashboard" && (
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+            {/* Calorie card */}
+            <div style={{ background:"linear-gradient(135deg,rgba(129,140,248,.18),rgba(99,102,241,.08))", border:"1px solid rgba(129,140,248,.2)", borderRadius:20, padding:20 }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:12 }}>今日熱量</div>
+              <div style={{ display:"flex", alignItems:"flex-end", gap:8, marginBottom:16 }}>
+                <span style={{ fontFamily:"'DM Mono',monospace", fontSize:42, fontWeight:700, color:"#818cf8", lineHeight:1 }}>{todayCal}</span>
+                <span style={{ fontSize:14, color:"rgba(255,255,255,.4)", marginBottom:6 }}>/ {targetCal} kcal</span>
+              </div>
+              <div style={{ background:"rgba(255,255,255,.06)", borderRadius:99, height:8, overflow:"hidden" }}>
+                <div style={{ height:"100%", borderRadius:99, width:`${Math.min(todayCal/targetCal*100,100)}%`, background: todayCal>targetCal ? "#f87171":"linear-gradient(90deg,#818cf8,#a78bfa)", transition:"width .6s ease" }}/>
+              </div>
+              <div style={{ display:"flex", justifyContent:"space-between", marginTop:8, fontSize:11, color:"rgba(255,255,255,.4)" }}>
+                <span>已攝取</span>
+                <span>{Math.max(targetCal-todayCal,0)} kcal 剩餘</span>
+              </div>
+            </div>
+
+            {/* Macro rings */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:16 }}>巨量營養素</div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12 }}>
+                <Ring value={todayProt} max={Math.round(parseFloat(profile.weight)*1.6)} color="#4ade80" label="蛋白質" sub={`${Math.round(todayProt)}g`}/>
+                <Ring value={todayCarb} max={Math.round(targetCal*0.45/4)} color="#facc15" label="碳水" sub={`${Math.round(todayCarb)}g`}/>
+                <Ring value={todayFat} max={Math.round(targetCal*0.3/9)} color="#fb923c" label="脂肪" sub={`${Math.round(todayFat)}g`}/>
+              </div>
+            </div>
+
+            {/* Water + Weight */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+              <div style={{ background:"rgba(56,189,248,.08)", border:"1px solid rgba(56,189,248,.15)", borderRadius:20, padding:16 }}>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,.4)", marginBottom:8 }}>今日飲水</div>
+                <div style={{ fontFamily:"'DM Mono',monospace", fontSize:22, fontWeight:700, color:"#38bdf8" }}>{waterIntake}<span style={{fontSize:12}}>ml</span></div>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,.3)", marginTop:4 }}>目標 {profile.waterGoal}ml</div>
+                <div style={{ background:"rgba(255,255,255,.06)", borderRadius:99, height:4, marginTop:8, overflow:"hidden" }}>
+                  <div style={{ height:"100%", borderRadius:99, width:`${Math.min(waterIntake/profile.waterGoal*100,100)}%`, background:"#38bdf8", transition:"width .4s" }}/>
+                </div>
+              </div>
+              <div style={{ background:"rgba(167,139,250,.08)", border:"1px solid rgba(167,139,250,.15)", borderRadius:20, padding:16 }}>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,.4)", marginBottom:8 }}>今日體重</div>
+                <div style={{ fontFamily:"'DM Mono',monospace", fontSize:22, fontWeight:700, color:"#a78bfa" }}>
+                  {weightLog.find(x=>x.d===today())?.w ?? "—"}<span style={{fontSize:12}}>kg</span>
+                </div>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,.3)", marginTop:4 }}>TDEE {tdee} kcal</div>
+              </div>
+            </div>
+
+            {/* Food log */}
+            {foodLog.length>0 && (
+              <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+                <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:12 }}>今日飲食紀錄</div>
+                {foodLog.map(f=>(
+                  <div key={f.id} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"8px 0", borderBottom:"1px solid rgba(255,255,255,.04)" }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                      <div style={{ width:8, height:8, borderRadius:"50%", background:SCORE_META[f.score]?.color||"#818cf8" }}/>
+                      <span style={{ fontSize:13 }}>{f.name}</span>
+                    </div>
+                    <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                      <span style={{ fontSize:11, background:SCORE_META[f.score]?.bg, color:SCORE_META[f.score]?.color, padding:"2px 8px", borderRadius:99 }}>{SCORE_META[f.score]?.label}</span>
+                      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:12, color:"rgba(255,255,255,.5)" }}>{f.cal}</span>
+                      <button onClick={()=>setFoodLog(l=>l.filter(x=>x.id!==f.id))} style={{ background:"none", border:"none", color:"rgba(255,255,255,.2)", cursor:"pointer", fontSize:14, padding:"0 4px" }}>×</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── DIET (AI Photo) ── */}
+        {tab==="diet" && (
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+            {/* Upload zone */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:16 }}>
+                <div style={{ width:6, height:6, borderRadius:"50%", background:"#4ade80" }}/>
+                <div style={{ fontSize:12, color:"rgba(255,255,255,.5)" }}>AI 餐點辨識</div>
+                <div style={{ marginLeft:"auto", fontSize:11, background:"rgba(74,222,128,.12)", color:"#4ade80", padding:"2px 8px", borderRadius:99 }}>Claude Vision</div>
+              </div>
+              {!foodImg ? (
+                <UploadZone onFile={handleFoodFile} accept="image/*" icon="🍱" color="#4ade80"
+                  label="拍攝或上傳餐點照片，AI 自動辨識熱量" />
+              ) : (
+                <div>
+                  <img src={foodImg} alt="food" style={{ width:"100%", borderRadius:12, maxHeight:200, objectFit:"cover", marginBottom:12 }}/>
+                  {foodLoading && <Spinner color="#4ade80"/>}
+                  {foodError && <div style={{ color:"#f87171", fontSize:13, textAlign:"center", padding:"12px 0" }}>{foodError}</div>}
+                  {foodResult && (
+                    <div>
+                      {/* Advice */}
+                      <div style={{ background:"rgba(74,222,128,.08)", border:"1px solid rgba(74,222,128,.2)", borderRadius:12, padding:"10px 14px", marginBottom:12, fontSize:13, color:"#4ade80", lineHeight:1.5 }}>
+                        💡 {foodResult.advice}
+                      </div>
+                      {/* Items */}
+                      {foodResult.items.map((item,i)=>(
+                        <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:"1px solid rgba(255,255,255,.04)" }}>
+                          <div>
+                            <div style={{ fontSize:13 }}>{item.name}</div>
+                            <div style={{ fontSize:11, color:"rgba(255,255,255,.35)", marginTop:2 }}>P:{item.p}g C:{item.c}g F:{item.f}g</div>
+                          </div>
+                          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                            <span style={{ background:SCORE_META[item.score]?.bg, color:SCORE_META[item.score]?.color, fontSize:11, padding:"2px 8px", borderRadius:99 }}>{SCORE_META[item.score]?.label}</span>
+                            <span style={{ fontFamily:"'DM Mono',monospace", fontSize:13, color:"#818cf8" }}>{item.cal}</span>
+                          </div>
+                        </div>
+                      ))}
+                      {/* Total */}
+                      <div style={{ display:"flex", justifyContent:"space-between", padding:"10px 0 0", fontSize:13 }}>
+                        <span style={{ color:"rgba(255,255,255,.5)" }}>合計</span>
+                        <span style={{ fontFamily:"'DM Mono',monospace", color:"#818cf8", fontWeight:700 }}>{foodResult.total.cal} kcal</span>
+                      </div>
+                      {/* Buttons */}
+                      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginTop:14 }}>
+                        <button onClick={()=>{setFoodImg(null);setFoodResult(null);}}
+                          style={{ background:"rgba(255,255,255,.06)", border:"none", borderRadius:12, color:"rgba(255,255,255,.6)", padding:"12px", fontSize:13, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
+                          重新拍攝
+                        </button>
+                        <button onClick={handleAddAllItems}
+                          style={{ background:"linear-gradient(135deg,#4ade80,#22c55e)", border:"none", borderRadius:12, color:"#0b0f1a", padding:"12px", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
+                          加入今日紀錄
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {!foodLoading && !foodResult && !foodError && (
+                    <button onClick={()=>{setFoodImg(null);}}
+                      style={{ background:"rgba(255,255,255,.04)", border:"none", borderRadius:12, color:"rgba(255,255,255,.4)", padding:"10px", fontSize:13, cursor:"pointer", width:"100%", fontFamily:"'DM Sans',sans-serif" }}>
+                      取消
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Today macros */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+                <div style={{ fontSize:12, color:"rgba(255,255,255,.5)" }}>今日攝取總覽</div>
+                <div style={{ fontFamily:"'DM Mono',monospace", fontSize:14, color:"#818cf8" }}>{todayCal} / {targetCal} kcal</div>
+              </div>
+              {[
+                {label:"蛋白質",val:todayProt,target:Math.round(parseFloat(profile.weight)*1.6),color:"#4ade80"},
+                {label:"碳水化合物",val:todayCarb,target:Math.round(targetCal*0.45/4),color:"#facc15"},
+                {label:"脂肪",val:todayFat,target:Math.round(targetCal*0.3/9),color:"#fb923c"},
+              ].map(m=>(
+                <div key={m.label} style={{ marginBottom:12 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, marginBottom:6 }}>
+                    <span style={{ color:"rgba(255,255,255,.6)" }}>{m.label}</span>
+                    <span style={{ fontFamily:"'DM Mono',monospace", color:m.color }}>{Math.round(m.val)}g / {m.target}g</span>
+                  </div>
+                  <div style={{ background:"rgba(255,255,255,.06)", borderRadius:99, height:6, overflow:"hidden" }}>
+                    <div style={{ height:"100%", borderRadius:99, width:`${Math.min(m.val/m.target*100,100)}%`, background:m.color, transition:"width .4s" }}/>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Food log */}
+            {foodLog.length>0 && (
+              <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+                <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:12 }}>已記錄食物</div>
+                {foodLog.map(f=>(
+                  <div key={f.id} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:"1px solid rgba(255,255,255,.04)" }}>
+                    <span style={{ fontSize:13 }}>{f.name}</span>
+                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:12, color:"rgba(255,255,255,.4)" }}>{f.cal} kcal</span>
+                      <button onClick={()=>setFoodLog(l=>l.filter(x=>x.id!==f.id))} style={{ background:"none", border:"none", color:"rgba(255,255,255,.2)", cursor:"pointer", fontSize:14 }}>×</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── WEIGHT ── */}
+        {tab==="weight" && (
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+            <div style={{ background:"rgba(167,139,250,.08)", border:"1px solid rgba(167,139,250,.2)", borderRadius:20, padding:20 }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:12 }}>記錄今日體重</div>
+              <div style={{ display:"flex", gap:10 }}>
+                <input value={todayWeight} onChange={e=>setTodayWeight(e.target.value)} placeholder="體重 (kg)" type="number" step="0.1"/>
+                <button onClick={logWeight} style={{ background:"linear-gradient(135deg,#a78bfa,#8b5cf6)", border:"none", borderRadius:12, color:"white", padding:"10px 20px", fontSize:14, fontWeight:600, cursor:"pointer", whiteSpace:"nowrap", fontFamily:"'DM Sans',sans-serif" }}>記錄</button>
+              </div>
+            </div>
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:12 }}>近期趨勢</div>
+              <WeightChart data={[...weightLog].sort((a,b)=>a.d.localeCompare(b.d))}/>
+            </div>
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:12 }}>歷史紀錄</div>
+              {[...weightLog].sort((a,b)=>b.d.localeCompare(a.d)).slice(0,10).map((e,i)=>(
+                <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"8px 0", borderBottom:"1px solid rgba(255,255,255,.04)", fontSize:13 }}>
+                  <span style={{ color:"rgba(255,255,255,.5)" }}>{e.d}</span>
+                  <span style={{ fontFamily:"'DM Mono',monospace", color:"#a78bfa" }}>{e.w} kg</span>
+                </div>
+              ))}
+              {!weightLog.length && <div style={{ color:"rgba(255,255,255,.3)", fontSize:13 }}>尚無記錄</div>}
+            </div>
+          </div>
+        )}
+
+        {/* ── WATER ── */}
+        {tab==="water" && (
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+            <div style={{ background:"rgba(56,189,248,.08)", border:"1px solid rgba(56,189,248,.2)", borderRadius:20, padding:24, textAlign:"center" }}>
+              <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:52, color:"#38bdf8", lineHeight:1 }}>{waterIntake}</div>
+              <div style={{ fontSize:13, color:"rgba(255,255,255,.4)", marginTop:4 }}>ml / 目標 {profile.waterGoal} ml</div>
+              <div style={{ background:"rgba(255,255,255,.06)", borderRadius:99, height:10, marginTop:20, overflow:"hidden" }}>
+                <div style={{ height:"100%", borderRadius:99, width:`${Math.min(waterIntake/profile.waterGoal*100,100)}%`, background:"linear-gradient(90deg,#38bdf8,#0ea5e9)", transition:"width .4s" }}/>
+              </div>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,.4)", marginTop:8 }}>{Math.round(waterIntake/profile.waterGoal*100)}% 完成</div>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+              {[150,200,250,500].map(ml=>(
+                <button key={ml} onClick={()=>addWater(ml)} style={{ background:"rgba(56,189,248,.1)", border:"1px solid rgba(56,189,248,.2)", borderRadius:16, color:"#38bdf8", padding:"16px", fontSize:16, fontWeight:600, cursor:"pointer", fontFamily:"'DM Mono',monospace" }}>
+                  +{ml}ml
+                </button>
+              ))}
+            </div>
+            <button onClick={()=>setWaterIntake(0)} style={{ background:"rgba(255,255,255,.04)", border:"1px solid rgba(255,255,255,.08)", borderRadius:16, color:"rgba(255,255,255,.4)", padding:"12px", fontSize:13, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
+              重置今日水分
+            </button>
+          </div>
+        )}
+
+        {/* ── PROFILE ── */}
+        {tab==="profile" && (
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+
+            {/* InBody Upload */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:16 }}>
+                <div style={{ width:6, height:6, borderRadius:"50%", background:"#818cf8" }}/>
+                <div style={{ fontSize:12, color:"rgba(255,255,255,.5)" }}>InBody / 體組成報告掃描</div>
+                <div style={{ marginLeft:"auto", fontSize:11, background:"rgba(129,140,248,.12)", color:"#818cf8", padding:"2px 8px", borderRadius:99 }}>Claude Vision</div>
+              </div>
+              {!inbodyImg ? (
+                <UploadZone onFile={handleInBodyFile} accept="image/*" icon="📋" color="#818cf8"
+                  label="上傳 InBody 報告截圖，AI 自動填入體脂、肌肉等數值" />
+              ) : (
+                <div>
+                  <img src={inbodyImg} alt="inbody" style={{ width:"100%", borderRadius:12, maxHeight:160, objectFit:"cover", marginBottom:12 }}/>
+                  {inbodyLoading && <Spinner color="#818cf8"/>}
+                  {inbodyError && <div style={{ color:"#f87171", fontSize:13, textAlign:"center" }}>{inbodyError}</div>}
+                  {inbodyResult && (
+                    <div>
+                      {/* Assessment */}
+                      <div style={{ background:"rgba(129,140,248,.08)", border:"1px solid rgba(129,140,248,.2)", borderRadius:12, padding:"10px 14px", marginBottom:12, fontSize:13, color:"#818cf8", lineHeight:1.5 }}>
+                        🔍 {inbodyResult.assessment}
+                      </div>
+                      {/* Values */}
+                      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:12 }}>
+                        {[
+                          {label:"體重",val:inbodyResult.weight,unit:"kg"},
+                          {label:"體脂率",val:inbodyResult.bodyFat,unit:"%"},
+                          {label:"骨骼肌",val:inbodyResult.muscleMass,unit:"kg"},
+                          {label:"體脂肪",val:inbodyResult.fatMass,unit:"kg"},
+                          {label:"BMI",val:inbodyResult.bmi,unit:""},
+                          {label:"基礎代謝",val:inbodyResult.bmr,unit:"kcal"},
+                          {label:"內臟脂肪",val:inbodyResult.visceralFat,unit:"級"},
+                          {label:"體水分",val:inbodyResult.bodyWater,unit:"kg"},
+                        ].filter(x=>x.val!=null).map((x,i)=>(
+                          <div key={i} style={{ background:"rgba(255,255,255,.04)", borderRadius:10, padding:"10px 12px" }}>
+                            <div style={{ fontSize:11, color:"rgba(255,255,255,.4)" }}>{x.label}</div>
+                            <div style={{ fontFamily:"'DM Mono',monospace", fontSize:16, color:"#818cf8", fontWeight:700, marginTop:2 }}>{x.val}<span style={{fontSize:11}}>{x.unit}</span></div>
+                          </div>
+                        ))}
+                      </div>
+                      {/* Suggestions */}
+                      {inbodyResult.suggestions?.length>0 && (
+                        <div style={{ marginBottom:12 }}>
+                          <div style={{ fontSize:11, color:"rgba(255,255,255,.4)", marginBottom:8 }}>建議</div>
+                          {inbodyResult.suggestions.map((s,i)=>(
+                            <div key={i} style={{ display:"flex", gap:8, fontSize:12, color:"rgba(255,255,255,.6)", padding:"4px 0" }}>
+                              <span style={{ color:"#818cf8" }}>→</span><span>{s}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div style={{ fontSize:11, color:"#4ade80", padding:"6px 0" }}>✓ 體重與體脂率已自動填入下方資料</div>
+                      <button onClick={()=>{setInbodyImg(null);setInbodyResult(null);}}
+                        style={{ background:"rgba(255,255,255,.04)", border:"none", borderRadius:10, color:"rgba(255,255,255,.4)", padding:"8px", fontSize:12, cursor:"pointer", width:"100%", marginTop:8, fontFamily:"'DM Sans',sans-serif" }}>
+                        重新上傳
+                      </button>
+                    </div>
+                  )}
+                  {!inbodyLoading && !inbodyResult && !inbodyError && (
+                    <button onClick={()=>setInbodyImg(null)}
+                      style={{ background:"rgba(255,255,255,.04)", border:"none", borderRadius:12, color:"rgba(255,255,255,.4)", padding:"10px", fontSize:13, cursor:"pointer", width:"100%", fontFamily:"'DM Sans',sans-serif" }}>
+                      取消
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Manual profile */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:16 }}>基本資料（手動填寫）</div>
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+                {[
+                  {key:"name",label:"姓名",type:"text",ph:"你的名字"},
+                  {key:"age",label:"年齡",type:"number",ph:"25"},
+                  {key:"height",label:"身高 (cm)",type:"number",ph:"170"},
+                  {key:"weight",label:"體重 (kg)",type:"number",ph:"70"},
+                  {key:"bodyFat",label:"體脂率 (%)",type:"number",ph:"留空則用 Mifflin-St Jeor"},
+                  {key:"waterGoal",label:"每日飲水目標 (ml)",type:"number",ph:"2000"},
+                ].map(f=>(
+                  <div key={f.key}>
+                    <div style={{ fontSize:11, color:"rgba(255,255,255,.4)", marginBottom:4 }}>{f.label}</div>
+                    <input type={f.type} value={profile[f.key]} placeholder={f.ph}
+                      onChange={e=>setProfile(p=>({...p,[f.key]:e.target.value}))}/>
+                  </div>
+                ))}
+                <div>
+                  <div style={{ fontSize:11, color:"rgba(255,255,255,.4)", marginBottom:4 }}>性別</div>
+                  <select value={profile.gender} onChange={e=>setProfile(p=>({...p,gender:e.target.value}))}>
+                    <option value="male">男</option><option value="female">女</option>
+                  </select>
+                </div>
+                <div>
+                  <div style={{ fontSize:11, color:"rgba(255,255,255,.4)", marginBottom:4 }}>活動量</div>
+                  <select value={profile.activity} onChange={e=>setProfile(p=>({...p,activity:e.target.value}))}>
+                    {Object.entries(ACT_LABELS).map(([v,l])=><option key={v} value={v}>{l}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <div style={{ fontSize:11, color:"rgba(255,255,255,.4)", marginBottom:4 }}>目標</div>
+                  <select value={profile.goal} onChange={e=>setProfile(p=>({...p,goal:e.target.value}))}>
+                    <option value="lose">減重 (-500kcal)</option>
+                    <option value="maintain">維持體重</option>
+                    <option value="gain">增肌 (+300kcal)</option>
+                  </select>
+                </div>
+                <button onClick={()=>{setProfileSaved(true);setTimeout(()=>setProfileSaved(false),2000);}}
+                  style={{ background:"linear-gradient(135deg,#818cf8,#6366f1)", border:"none", borderRadius:12, color:"white", padding:"14px", fontSize:14, fontWeight:600, cursor:"pointer", marginTop:4, fontFamily:"'DM Sans',sans-serif" }}>
+                  {profileSaved ? "✓ 已儲存" : "儲存資料"}
+                </button>
+              </div>
+            </div>
+
+            {/* Stats */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:20, padding:20 }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,.5)", marginBottom:16 }}>計算結果</div>
+              {[
+                {label:"基礎代謝率 (BMR)",val:`${bmr} kcal`,color:"#818cf8"},
+                {label:"總熱量消耗 (TDEE)",val:`${tdee} kcal`,color:"#a78bfa"},
+                {label:"每日攝取目標",val:`${targetCal} kcal`,color:"#4ade80"},
+                {label:"建議蛋白質",val:`${Math.round(parseFloat(profile.weight)*1.6)}g`,color:"#34d399"},
+                {label:"BMI",val:(parseFloat(profile.weight)/(parseFloat(profile.height)/100)**2).toFixed(1),color:"#facc15"},
+              ].map(s=>(
+                <div key={s.label} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:"1px solid rgba(255,255,255,.04)" }}>
+                  <span style={{ fontSize:13, color:"rgba(255,255,255,.6)" }}>{s.label}</span>
+                  <span style={{ fontFamily:"'DM Mono',monospace", fontSize:13, color:s.color, fontWeight:700 }}>{s.val}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Bottom Nav */}
+      <div style={{ position:"fixed", bottom:0, left:"50%", transform:"translateX(-50%)", width:"100%", maxWidth:420, background:"rgba(11,15,26,.92)", backdropFilter:"blur(20px)", borderTop:"1px solid rgba(255,255,255,.08)", display:"flex", padding:"8px 0 calc(8px + env(safe-area-inset-bottom))" }}>
+        {TABS.map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)} style={{ flex:1, background:"none", border:"none", color:tab===t.id?"#818cf8":"rgba(255,255,255,.3)", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:4, padding:"6px 0", transition:"color .2s" }}>
+            <span style={{ fontSize:18 }}>{t.icon}</span>
+            <span style={{ fontSize:10, fontFamily:"'DM Sans',sans-serif", fontWeight:tab===t.id?600:400 }}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
